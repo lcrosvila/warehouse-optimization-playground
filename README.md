@@ -49,12 +49,11 @@ Each segment is routed independently, so the ordering guarantee is hard.
 | File | Role |
 |------|------|
 | `graph.py` | Directed routing graph: one-way aisles, depot, Dijkstra distances |
-| `data_gen.py` | Synthetic data generator — same DataFrame schema as the real DB |
+| `data_gen.py` | Synthetic data generator |
 | `tsp.py` | Eight TSP solvers with a unified `solver=` interface |
 | `des.py` | SimPy DES: picker pool, aisle contention, replenishment, fatigue, machinery |
 | `run_demo.py` | End-to-end demo — run this to see everything working |
 
-All files are self-contained; they do **not** import from the main repository.
 
 ---
 
@@ -140,6 +139,113 @@ only replacing the `generate()` call.
 | `inventory` | `item`, `location_id`, `qty` |
 | `transactions` | `pickrun_no`, `order_no`, `item`, `location_id`, `qty`, `day`, `timestamp` |
 | `item_links` | `item`, `community_id`, `community_priority` |
+
+---
+
+## Working with the data
+
+### What the generator already models realistically
+
+`data_gen.generate()` is not just random noise — several properties were
+deliberately tuned to match the production warehouse:
+
+- **Pareto demand** (`picks_30`, `picks_60`): item velocity follows a Pareto
+  distribution with shape 1.2, giving a roughly 80/20 fast/slow split.
+  The `picks_trend` column (ratio of last-30-day to last-60-day picks) models
+  seasonal acceleration or deceleration.
+- **Zone layout** (70 % AMBIENT / 20 % CHILLER / 10 % FREEZER): aisles are
+  grouped by temperature zone left-to-right, matching the physical layout of
+  most cold-chain warehouses.
+- **Weight-constrained slotting**: the heaviest items are assigned to the
+  highest-capacity locations within each zone.  Items that exceed all available
+  slot capacities are silently dropped — the same behaviour as the real slotting
+  engine.
+- **Staggered release times**: each pickrun gets a timestamp drawn uniformly
+  within a 16-hour window (06:00–22:00), so the DES models realistic order
+  waves rather than a single burst at t=0.
+
+### Generator parameters
+
+| Parameter | Default | What it controls |
+|-----------|---------|-----------------|
+| `n_aisles` | 10 | Width of the warehouse (x dimension) |
+| `n_positions` | 20 | Depth of each aisle (y dimension) |
+| `n_items` | 300 | SKU count |
+| `n_pickruns` | 500 | Orders to generate |
+| `max_lines_per_run` | 8 | Upper bound on picks per order (uniform draw from [2, max]) |
+| `n_days` | 90 | Spread pickruns across this many calendar days |
+| `seed` | 42 | Random seed; change it to get a different-but-equally-valid instance |
+
+### Scenario recipes
+
+**Busy single shift** — all 500 orders released on one day, creating realistic
+queuing pressure in the DES:
+```python
+ds = generate(n_pickruns=500, n_days=1, seed=42)
+```
+
+**Large warehouse** — 20 aisles, 40 positions, more SKUs:
+```python
+ds = generate(n_aisles=20, n_positions=40, n_items=800, n_pickruns=1000)
+```
+
+**Small, dense warehouse** — few aisles, long pickruns, high contention:
+```python
+ds = generate(n_aisles=4, n_positions=30, n_items=100, max_lines_per_run=15)
+```
+
+**Heavy-goods warehouse** — tweak item weights after generation to put most
+SKUs in the 200–2000 kg range (forklifts required, ergonomic ordering matters
+most):
+```python
+ds = generate(seed=1)
+ds.items["weight"] = np.random.default_rng(1).uniform(200, 2000, len(ds.items)).round(1)
+```
+
+**Highly skewed demand** — simulate a warehouse where a handful of SKUs drive
+almost everything (sharper Pareto, e.g. a 95/5 split).  Open `data_gen.py`,
+change the Pareto shape parameter:
+```python
+picks_60 = (rng.pareto(0.5, n_items) * 8).astype(int) + 1   # was 1.2 → now 0.5
+```
+Lower shape → heavier tail → more extreme fast/slow split.
+
+**Multi-day demand with trend** — spread orders across many days and observe
+how `picks_trend` diverges from 1.0 for fast-growing or declining SKUs:
+```python
+ds = generate(n_pickruns=2000, n_days=90, seed=7)
+# Items with picks_trend > 1.3 are accelerating; < 0.7 are declining
+fast_movers = ds.items[ds.items["picks_trend"] > 1.3]
+```
+
+**Zone-crossing experiments** — the current DES ignores zone boundaries.  Add
+a zone-crossing penalty by checking whether consecutive tiles in a route cross
+from one zone to another, and injecting an `env.timeout(penalty_s)` for each
+crossing (a natural extension of `_do_route` in `des.py`).
+
+### Plugging in real data
+
+The `Dataset` dataclass is the only contract between the data layer and the
+rest of the playground.  To use real data, implement a loader that returns the
+same six DataFrames:
+
+```python
+# data_loader_real.py  (not in this repo — lives in the main codebase)
+def load_from_db(conn, date: str) -> Dataset:
+    items        = pd.read_sql("SELECT ...", conn)
+    locations    = pd.read_sql("SELECT ...", conn)
+    ...
+    return Dataset(items, locations, loc_features, item_links, inventory, transactions)
+```
+
+Then in `run_demo.py`, swap one line:
+```python
+# ds = generate(...)       # synthetic
+ds = load_from_db(conn, "2024-03-15")   # real
+```
+
+Nothing else changes.  The column names in `Dataset` were chosen to match the
+real DB schema exactly so this substitution is always a one-liner.
 
 ---
 
