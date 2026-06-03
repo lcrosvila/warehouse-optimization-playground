@@ -13,11 +13,17 @@ Available solvers (pass ``solver=`` to ``route_all_pickruns``):
 
 Pick-ordering constraints (same in every solver):
 
-  Segment 1: heavy items   (weight ≥ 500 kg) — picked first
-  Segment 2: normal items
-  Segment 3: fragile items (weight ≤  50 kg) — picked last
+  Temperature axis (when cold_last=True in route_all_pickruns):
+    AMBIENT items first → CHILLER → FREEZER last
+    Prevents cold items from defrosting while the picker walks the ambient aisles.
 
-Each segment is routed independently, so the ordering guarantee is hard.
+  Weight axis (always enforced within each temperature group):
+    Segment 1: heavy items   (weight ≥ 500 kg) — picked first
+    Segment 2: normal items
+    Segment 3: fragile items (weight ≤  50 kg) — picked last
+
+Combined, this gives up to 9 ordered segments. Each is routed independently,
+so both constraint guarantees are hard.
 """
 from __future__ import annotations
 
@@ -35,6 +41,12 @@ PICK_TIME_S = 4.0   # time to pick one item in seconds
 
 HEAVY_KG   = 500    # weight threshold for "heavy" pick class
 FRAGILE_KG =  50    # weight threshold for "fragile" pick class
+
+# Temperature zone ordering: ambient before cold so cold items defrost last.
+# These must match the zone_type_1 values produced by data_gen.
+COLD_ZONES  = ("AMBIENT", "CHILLER", "FREEZER")
+_ZONE_RANK  = {z: i for i, z in enumerate(COLD_ZONES)}   # AMBIENT=0, FREEZER=2
+_WEIGHT_CLS = ("heavy", "normal", "fragile")
 
 
 class RouteResult(NamedTuple):
@@ -607,9 +619,10 @@ def route_pickrun(
     graph: WarehouseGraph,
     item_weight: dict[str, float],
     solver: str = "nn",
+    loc_zone: dict[str, str] | None = None,
     **solver_kwargs,
 ) -> RouteResult:
-    """Route one pickrun with heavy → normal → fragile segment ordering.
+    """Route one pickrun respecting weight and optional cold-chain ordering.
 
     Parameters
     ----------
@@ -617,37 +630,52 @@ def route_pickrun(
     graph          : WarehouseGraph
     item_weight    : {item: weight_kg} lookup
     solver         : one of "nn", "2opt", "or_opt", "sa", "aisle_nn",
-                     "bucketed", "mst"  (see module docstring)
+                     "bucketed", "mst", "aco"  (see module docstring)
+    loc_zone       : optional {location_id: zone_type_1} lookup.  When
+                     provided, AMBIENT items are picked before CHILLER before
+                     FREEZER so cold items spend the least time outside
+                     refrigeration.  Within each zone, the heavy→normal→fragile
+                     weight ordering still applies.
     **solver_kwargs: forwarded to the solver (e.g. bucket_size=5, n_iter=6000)
     """
-    heavy:   list[str] = []
-    normal:  list[str] = []
-    fragile: list[str] = []
-    orig_classes: list[str] = []
+    # Build per-segment tile buckets.
+    # With loc_zone: 9 buckets keyed (zone, weight_cls).
+    # Without:       3 buckets keyed by weight_cls only (backward-compatible).
+    if loc_zone is not None:
+        seg_buckets: dict[tuple[str, str], list[str]] = {
+            (z, w): [] for z in COLD_ZONES for w in _WEIGHT_CLS
+        }
+    else:
+        seg_buckets = {("AMBIENT", w): [] for w in _WEIGHT_CLS}
+
+    # (zone_rank, weight_rank) of each item in original transaction order,
+    # used to count how many ordering constraints the raw transactions violate.
+    orig_keys: list[tuple[int, int]] = []
 
     for row in pickrun_items.itertuples(index=False):
-        cls = _classify(item_weight.get(row.item, 0.0))
-        orig_classes.append(cls)
-        tile = graph.loc_to_tile(row.location_id)
-        if cls == "heavy":
-            heavy.append(tile)
-        elif cls == "fragile":
-            fragile.append(tile)
-        else:
-            normal.append(tile)
+        w_cls = _classify(item_weight.get(row.item, 0.0))
+        tile  = graph.loc_to_tile(row.location_id)
+        z_cls = loc_zone.get(row.location_id, "AMBIENT") if loc_zone else "AMBIENT"
+        orig_keys.append((_ZONE_RANK.get(z_cls, 0), _WEIGHT_CLS.index(w_cls)))
+        seg_buckets[(z_cls if loc_zone else "AMBIENT", w_cls)].append(tile)
 
-    # Count ordering violations in the original transaction sequence.
-    _rank = {"heavy": 0, "normal": 1, "fragile": 2}
+    # Violations = items that arrive out of (zone, weight) order in the raw txns.
     ordering_fixes = sum(
-        1 for i in range(1, len(orig_classes))
-        if _rank[orig_classes[i]] < _rank[orig_classes[i - 1]]
+        1 for i in range(1, len(orig_keys))
+        if orig_keys[i] < orig_keys[i - 1]
     )
 
     full_route = [graph.start_tile]
     total_dist = 0.0
     cur = graph.start_tile
 
-    for segment in (heavy, normal, fragile):
+    segment_order = (
+        [(z, w) for z in COLD_ZONES for w in _WEIGHT_CLS]
+        if loc_zone is not None
+        else [("AMBIENT", w) for w in _WEIGHT_CLS]
+    )
+    for key in segment_order:
+        segment = seg_buckets[key]
         if not segment:
             continue
         seg_route, seg_dist = _apply_solver(solver, segment, cur, graph, **solver_kwargs)
@@ -698,8 +726,10 @@ def route_all_pickruns(
     transactions: pd.DataFrame,
     graph: WarehouseGraph,
     items_df: pd.DataFrame,
+    locations_df: pd.DataFrame | None = None,
     max_pickruns: int | None = None,
     solver: str = "nn",
+    cold_last: bool = False,
     **solver_kwargs,
 ) -> list[RouteResult]:
     """Route every pickrun in ``transactions``.
@@ -709,8 +739,12 @@ def route_all_pickruns(
     transactions  : DataFrame with columns [pickrun_no, item, location_id, ...]
     graph         : WarehouseGraph
     items_df      : items DataFrame with at least [item, weight] columns
+    locations_df  : locations DataFrame with [location_id, zone_type_1] — required
+                    when cold_last=True
     max_pickruns  : cap on pickruns routed (useful for quick iteration)
     solver        : routing algorithm — see module docstring for options
+    cold_last     : enforce AMBIENT → CHILLER → FREEZER ordering so cold items
+                    are picked at the end of each pickrun.  Requires locations_df.
     **solver_kwargs: forwarded to the solver (e.g. bucket_size=5)
 
     Returns
@@ -719,15 +753,22 @@ def route_all_pickruns(
     """
     item_weight   = dict(zip(items_df["item"], items_df["weight"]))
     release_times = _release_times(transactions)
-    results: list[RouteResult] = []
 
+    loc_zone: dict[str, str] | None = None
+    if cold_last:
+        if locations_df is None:
+            raise ValueError("cold_last=True requires locations_df")
+        loc_zone = dict(zip(locations_df["location_id"], locations_df["zone_type_1"]))
+
+    results: list[RouteResult] = []
     for pr_no, grp in transactions.groupby("pickrun_no", sort=False):
         if max_pickruns is not None and len(results) >= max_pickruns:
             break
         rows = grp[["item", "location_id"]].dropna()
         if rows.empty:
             continue
-        rr = route_pickrun(rows, graph, item_weight, solver=solver, **solver_kwargs)
+        rr = route_pickrun(rows, graph, item_weight,
+                           solver=solver, loc_zone=loc_zone, **solver_kwargs)
         release = release_times.get(str(pr_no), 0.0)
         results.append(rr._replace(release_s=release))
 

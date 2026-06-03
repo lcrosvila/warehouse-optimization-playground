@@ -84,6 +84,38 @@ routes = route_all_pickruns(..., solver="sa", n_iter=8000, T_start=200.0)
 routes = route_all_pickruns(..., solver="aco", n_ants=30, n_iterations=80)
 ```
 
+### Cold-chain ordering
+
+Pass `cold_last=True` (and `locations_df`) to enforce an additional ordering
+constraint: AMBIENT items are always picked before CHILLER, and CHILLER before
+FREEZER.  This prevents cold items from sitting in the picker's cart while the
+picker walks warm aisles.
+
+```python
+routes = route_all_pickruns(
+    ds.transactions, graph, ds.items,
+    locations_df=ds.locations,   # needed to look up each location's zone
+    solver="2opt",
+    cold_last=True,
+)
+```
+
+Combined with the weight constraint, this produces up to **9 ordered segments**
+per pickrun: `(AMBIENT·heavy, AMBIENT·normal, AMBIENT·fragile, CHILLER·heavy,
+…, FREEZER·fragile)`.  Each segment is routed independently, so both guarantees
+are hard — no cold item will ever appear before all ambient items in the route.
+
+The `ordering_fixes` field in `RouteResult` counts how many items in the
+original transaction were out of order relative to the enforced constraints.
+With `cold_last=True`, this number includes zone violations as well as weight
+violations, so it will be higher than without — that's expected; it's telling
+you how often the raw order data violates the cold-chain rule.
+
+Note: because cold zones are physically grouped on one side of the warehouse,
+enforcing cold-last sometimes *reduces* total route distance by clustering the
+route spatially.  Compare the "NN (cold-last)" row in the solver table when you
+run `run_demo.py`.
+
 ---
 
 ## DES parameters
@@ -218,6 +250,20 @@ ds = generate(n_pickruns=2000, n_days=90, seed=7)
 fast_movers = ds.items[ds.items["picks_trend"] > 1.3]
 ```
 
+**Cold-chain heavy** — most items require refrigeration, amplifying the
+cold-last constraint:
+```python
+ds = generate(seed=3)
+# Reassign 80% of items to CHILLER/FREEZER
+ds.items["zone_type_1"] = np.where(
+    np.random.default_rng(3).random(len(ds.items)) < 0.8,
+    np.random.default_rng(4).choice(["CHILLER", "FREEZER"], len(ds.items)),
+    "AMBIENT",
+)
+```
+Then compare routes with and without `cold_last=True` — the ordering_fixes
+difference quantifies how badly the unconstrained solver violates cold-chain.
+
 **Zone-crossing experiments** — the current DES ignores zone boundaries.  Add
 a zone-crossing penalty by checking whether consecutive tiles in a route cross
 from one zone to another, and injecting an `env.timeout(penalty_s)` for each
@@ -343,6 +389,38 @@ the detour-penalty approach.
 
 ---
 
+### Task 4 — Cold-chain constraints
+
+The `cold_last=True` flag forces AMBIENT → CHILLER → FREEZER pick ordering so
+cold items spend the least time outside refrigeration.  Several follow-on
+questions to explore:
+
+**4a. How often does the raw order violate cold-chain?**
+Run the solver comparison with and without `cold_last=True` and compare the
+`ordering_fixes` column.  Each extra fix represents a cold item that would have
+been picked before an ambient one.
+
+**4b. Cost of the constraint**
+For most warehouse layouts, cold zones are physically grouped, so enforcing
+cold-last often *reduces* total route distance (you stop backtracking into the
+cold area).  But in some layouts it could increase distance.  Generate a
+warehouse where cold zones are interspersed across all aisles (edit `data_gen.py`
+to assign zones randomly rather than by aisle) and measure the distance penalty.
+
+**4c. Dwell-time model in the DES**
+Currently the DES ignores temperature — it doesn't track how long cold items
+sit in the cart.  Extend `des.py` to compute, for each cold item in a pickrun,
+the time from when it was picked to when the pickrun ends (the "dwell time").
+This is a better measure of cold-chain compliance than ordering violations alone,
+because a correctly-ordered route still has the first CHILLER item in the cart
+for the entire FREEZER segment.
+
+**4d. Zone-crossing penalty**
+Add an `env.timeout(zone_cross_penalty_s)` in `_do_route` when consecutive
+tiles in a route belong to different zones.  Does this change which solver wins?
+
+---
+
 ## Key constants
 
 | Constant | Location | Value | Meaning |
@@ -351,4 +429,5 @@ the detour-penalty approach.
 | `PICK_TIME_S` | `tsp.py` | 4.0 s | Default per-item pick time |
 | `HEAVY_KG` | `tsp.py` | 500 kg | Heavy-class weight threshold |
 | `FRAGILE_KG` | `tsp.py` | 50 kg | Fragile-class weight threshold |
+| `COLD_ZONES` | `tsp.py` | `("AMBIENT","CHILLER","FREEZER")` | Temperature zone order for cold-last routing |
 | `UNIT_DIST` | `graph.py` | 2.0 m | Metres per grid unit |

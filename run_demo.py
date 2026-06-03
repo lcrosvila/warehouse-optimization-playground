@@ -88,38 +88,45 @@ def main() -> None:
     # 3. TSP solver comparison (200-pickrun sample)
     # ------------------------------------------------------------------
     print("\n[3/6] TSP solver comparison (200 pickruns each)...")
-    print(f"\n      {'Solver':<18}  {'Avg dist/run':>12}  {'vs NN':>7}  {'Time':>7}")
-    print(f"      {'-'*18}  {'-'*12}  {'-'*7}  {'-'*7}")
+    print(f"\n      {'Solver':<22}  {'Avg dist/run':>12}  {'vs NN':>7}  {'Time':>7}  {'Order fixes':>12}")
+    print(f"      {'-'*22}  {'-'*12}  {'-'*7}  {'-'*7}  {'-'*12}")
 
     SOLVER_LABELS = [
-        ("nn",        "Nearest-neighbor"),
-        ("2opt",      "NN + 2-opt"),
-        ("or_opt",    "NN + or-opt"),
-        ("aisle_nn",  "Aisle-sorted NN"),
-        ("bucketed",  "Bucketed brute"),
-        ("sa",        "Simul. annealing"),
-        ("mst",       "MST Christofides"),
-        ("aco",       "Ant Colony (ACO)"),
+        ("nn",        "Nearest-neighbor",          dict()),
+        ("2opt",      "NN + 2-opt",                dict()),
+        ("or_opt",    "NN + or-opt",               dict()),
+        ("aisle_nn",  "Aisle-sorted NN",           dict()),
+        ("bucketed",  "Bucketed brute",            dict()),
+        ("sa",        "Simul. annealing",          dict()),
+        ("mst",       "MST Christofides",          dict()),
+        ("aco",       "Ant Colony (ACO)",          dict()),
+        # Same solver but with cold-chain ordering enforced
+        ("nn",        "NN (cold-last)",            dict(cold_last=True)),
+        ("2opt",      "NN + 2-opt (cold-last)",    dict(cold_last=True)),
     ]
 
     routes_per_solver: dict[str, list] = {}
     nn_avg: float = 0.0
-    for key, label in SOLVER_LABELS:
+    for key, label, extra_kw in SOLVER_LABELS:
         t0 = time.time()
         try:
             rs = route_all_pickruns(
                 ds.transactions, graph, ds.items,
+                locations_df=ds.locations,
                 max_pickruns=200, solver=key,
+                **extra_kw,
             )
             elapsed  = time.time() - t0
             avg_dist = sum(r.total_dist_m for r in rs) / max(1, len(rs))
-            routes_per_solver[key] = rs
+            avg_fixes = sum(r.ordering_fixes for r in rs) / max(1, len(rs))
+            cache_key = label
+            routes_per_solver[cache_key] = rs
             vs = f"{_pct(nn_avg, avg_dist).strip():>7}" if nn_avg else "  base"
-            print(f"      {label:<18}  {avg_dist:>10.1f} m  {vs}  {elapsed:>5.2f}s")
-            if key == "nn":
+            print(f"      {label:<22}  {avg_dist:>10.1f} m  {vs}  {elapsed:>5.2f}s  {avg_fixes:>10.1f}")
+            if key == "nn" and not extra_kw:
                 nn_avg = avg_dist
         except ImportError as exc:
-            print(f"      {label:<18}  skipped ({exc})")
+            print(f"      {label:<22}  skipped ({exc})")
 
     # ------------------------------------------------------------------
     # 4. DES picker-count sweep (NN routes, all 500 pickruns)
@@ -128,7 +135,8 @@ def main() -> None:
     print(f"\n      {'Pickers':>7}  {'Makespan':>10}  {'Avg/run':>10}  {'Aisle wait':>11}")
     print(f"      {'-'*7}  {'-'*10}  {'-'*10}  {'-'*11}")
 
-    routes_nn   = route_all_pickruns(ds.transactions, graph, ds.items, solver="nn")
+    routes_nn   = route_all_pickruns(ds.transactions, graph, ds.items,
+                                     locations_df=ds.locations, solver="nn")
     prev_ms: float | None = None
     last_stats: dict = {}
     for n_p in [1, 2, 3, 4, 5]:
