@@ -8,11 +8,11 @@ warehouse pick-route optimisation.
 
 ```bash
 pip install -r requirements.txt
-python run_demo.py
+/path/to/python run_demo.py
 ```
 
-Expected output: a TSP comparison table (NN vs NN + 2-opt) and a picker-sweep
-table showing makespan vs staffing level.
+Expected output: a solver comparison table, a picker-count sweep, DES
+extension scenarios, and a machinery comparison.
 
 ---
 
@@ -24,20 +24,23 @@ of the optimisation work:
 
 1. **TSP** — in what order should the picker visit the locations to minimise
    total walking distance?
-2. **DES** — given several concurrent pickers, how do shared resources (aisles,
-   picker pool) create contention, and what is the overall *makespan*?
+2. **DES** — given several concurrent pickers and shared resources (aisles,
+   replenishment workers), what is the real-world *makespan* and where are
+   the bottlenecks?
 
-The warehouse is modelled as a rectangular grid with *one-way aisles* (odd-x
-columns are traversed south → north only).  One-way aisles prevent collisions
-but create queuing when multiple pickers want the same aisle at the same time.
+The warehouse is a rectangular grid.  *One-way aisles* (odd-x columns, south →
+north only) prevent head-on collisions but create queuing when multiple pickers
+want the same aisle simultaneously.
 
 Pick-ordering constraints apply for ergonomic and damage-prevention reasons:
 
 | Segment | Class    | Rule |
 |---------|----------|------|
-| 1st     | Heavy    | weight ≥ 500 kg — picked first (at the bottom of the cart) |
-| 2nd     | Normal   | all other items |
-| 3rd     | Fragile  | weight ≤ 50 kg — picked last (on top) |
+| 1st     | Heavy    | weight ≥ 500 kg — picked first (sits at the bottom of the cart) |
+| 2nd     | Normal   | everything else |
+| 3rd     | Fragile  | weight ≤ 50 kg — picked last (rests on top) |
+
+Each segment is routed independently, so the ordering guarantee is hard.
 
 ---
 
@@ -46,22 +49,88 @@ Pick-ordering constraints apply for ergonomic and damage-prevention reasons:
 | File | Role |
 |------|------|
 | `graph.py` | Directed routing graph: one-way aisles, depot, Dijkstra distances |
-| `data_gen.py` | Synthetic data generator — produces the same DataFrame schema as the real DB |
-| `tsp.py` | TSP solvers: nearest-neighbor baseline + 2-opt improvement |
-| `des.py` | SimPy DES: picker pool + one-way aisle contention model |
-| `run_demo.py` | End-to-end demo: generate → route (2 methods) → simulate (picker sweep) |
+| `data_gen.py` | Synthetic data generator — same DataFrame schema as the real DB |
+| `tsp.py` | Eight TSP solvers with a unified `solver=` interface |
+| `des.py` | SimPy DES: picker pool, aisle contention, replenishment, fatigue, machinery |
+| `run_demo.py` | End-to-end demo — run this to see everything working |
 
-All files are self-contained; they do **not** import from the rest of this
-repository.
+All files are self-contained; they do **not** import from the main repository.
+
+---
+
+## TSP solvers
+
+Pass `solver=` to `route_all_pickruns()` (or `route_pickrun()`).
+
+| Key | Algorithm | Notes |
+|-----|-----------|-------|
+| `"nn"` | Nearest-neighbor | Greedy O(n²) baseline (default) |
+| `"2opt"` | NN + 2-opt | Reverses sub-sequences; ~5–15% shorter routes |
+| `"or_opt"` | NN + or-opt | Relocates chains of 1–2 tiles to better gaps; often beats 2-opt |
+| `"aisle_nn"` | S-shape sweep | Sorts by aisle column, alternates direction; fast, layout-aware |
+| `"bucketed"` | Bucketed brute | NN picks buckets of 6; brute-forces permutations within each |
+| `"sa"` | Simulated annealing | Random 2-opt moves with temperature cooling; escapes local optima |
+| `"mst"` | MST Christofides | Minimum spanning tree + greedy odd-degree matching (needs scipy) |
+| `"aco"` | Ant Colony (ACO) | Pheromone-guided probabilistic search; see exploration tasks below |
+
+```python
+from tsp import route_all_pickruns
+
+# Swap one line to try a different solver
+routes = route_all_pickruns(ds.transactions, graph, ds.items, solver="or_opt")
+
+# Solvers accept keyword arguments forwarded from route_all_pickruns
+routes = route_all_pickruns(..., solver="bucketed", bucket_size=5)
+routes = route_all_pickruns(..., solver="sa", n_iter=8000, T_start=200.0)
+routes = route_all_pickruns(..., solver="aco", n_ants=30, n_iterations=80)
+```
+
+---
+
+## DES parameters
+
+`run_des()` accepts a growing set of optional parameters:
+
+| Parameter | Default | What it models |
+|-----------|---------|----------------|
+| `n_pickers` | 1 | Concurrent pickers sharing the warehouse |
+| `model_aisle_contention` | True | One-way aisles have capacity=1; others queue |
+| `n_replenishers` | 0 | Dedicated workers who restock empty slots |
+| `replenish_prob` | 0.0 | Fraction of picks that hit an empty slot |
+| `restock_time_s` | 30.0 | Seconds to service one empty slot |
+| `fatigue_pct_per_100_picks` | 0.0 | Speed reduction per 100 picks (linear) |
+| `machine_profile` | `HUMAN` | Speed and pick-time profile for the picker fleet |
+| `reroute_on_wait_s` | 0.0 | Re-order deferred tiles when aisle queue wait exceeds this |
+
+### Machine profiles
+
+Three presets are available in `des.py`; construct a custom one with
+`MachineProfile(name, speed_m_s, pick_time_s, narrow_ok, detour_factor)`.
+
+| Preset | Speed | Pick time | Narrow aisles |
+|--------|-------|-----------|---------------|
+| `HUMAN` | 1.5 m/s | 4 s | ✓ enters and queues |
+| `REACH_TRUCK` | 2.5 m/s | 7 s | ✓ enters and queues |
+| `COUNTERBALANCE` | 3.5 m/s | 10 s | ✗ pays 2.2× detour penalty |
+
+```python
+from des import run_des, REACH_TRUCK, MachineProfile
+
+# Use a preset
+stats = run_des(routes, graph, n_pickers=3, machine_profile=REACH_TRUCK)
+
+# Build a custom profile (e.g. a slow electric pallet jack)
+pallet_jack = MachineProfile("pallet_jack", speed_m_s=1.0, pick_time_s=6.0)
+stats = run_des(routes, graph, n_pickers=4, machine_profile=pallet_jack)
+```
 
 ---
 
 ## Data schema
 
 `data_gen.generate()` returns a `Dataset` with six DataFrames.  The column
-names match the real database loader exactly, so swapping in real data
-requires only replacing the `generate()` call — the rest of the code is
-unchanged.
+names match the real database loader exactly — swapping in real data requires
+only replacing the `generate()` call.
 
 | DataFrame | Key columns |
 |-----------|-------------|
@@ -74,43 +143,106 @@ unchanged.
 
 ---
 
-## Experiment ideas
+## Exploration tasks
 
-### TSP
-- **Baseline established**: nearest-neighbor heuristic in `tsp.nearest_neighbor()`.
-- **First experiment**: 2-opt is already implemented — run the demo and observe the improvement.
-- **Next steps**:
-  - Implement **or-opt**: move single tiles to a better position instead of reversing segments.
-  - Implement **3-opt** and compare the improvement-vs-runtime trade-off.
-  - Try a **zone-aware** strategy: cluster picks by module or aisle before NN.
-  - Study how the heavy/fragile segmentation affects overall route length.
+### Task 1 — Improve the ACO solver
 
-### DES
-- Sweep `n_pickers` and plot makespan to find the throughput knee.
-- Set `model_aisle_contention=False` and measure how much one-way aisles add.
-- Add a **replenishment queue**: a separate worker restocks slots when a picker
-  depletes one; each restock takes a fixed service time.
-- Model **picker fatigue**: reduce `SPEED_M_S` by a small factor after every N picks
-  within a shift.
-- Model **zone-crossing penalties**: e.g. entering the CHILLER zone adds a fixed delay.
+The `"aco"` solver in `tsp.py` is a working but intentionally basic port.
+It gets close to 2-opt quality without any of the standard improvements.
+Three concrete things to try, in rough order of difficulty:
 
-### Connecting to real data
+**1a. Symmetric pheromone deposit**
+Currently, when an ant uses edge (i → j), only `pheromone[i, j]` is updated.
+Add `pheromone[j, i] += deposit` as well.  Does it help on the warehouse's
+directed graph, or does asymmetry actually capture something useful?
 
-Replace `data_gen.generate()` with any function that returns a `Dataset` with
-the column schemas above.  Nothing else in the playground needs to change.
+**1b. Elitism**
+At the end of each iteration, deposit extra pheromone along the globally best
+tour found so far.  This reinforces good solutions more aggressively:
 
-The main repository's `data_loader.load_from_db()` returns an identical
-`Dataset` (from `data.py`); to use it here, copy the six DataFrames into
-the playground `Dataset` dataclass.
+```python
+# After the per-ant deposit loop:
+elite_deposit = 1.0 / best_cost
+for k in range(len(best_route_idx) - 1):
+    u = [0] + best_route_idx   # re-insert start node
+    pheromone[u[k], u[k+1]] += elite_deposit
+```
+
+**1c. Per-ant 2-opt**
+After each ant builds its tour, run one or two passes of `two_opt_improve`
+before computing the cost used for pheromone deposit.  The existing
+`two_opt_improve` function in `tsp.py` is ready to use.
+
+Measure each improvement with the solver comparison in `run_demo.py`.
 
 ---
 
-## Key constants (in `tsp.py` and `des.py`)
+### Task 2 — Dynamic rerouting
 
-| Constant | Value | Meaning |
-|----------|-------|---------|
-| `SPEED_M_S` | 1.5 m/s | Picker walking speed |
-| `PICK_TIME_S` | 4.0 s | Time to pick one item from its slot |
-| `HEAVY_KG` | 500 kg | Weight threshold for "heavy" class |
-| `FRAGILE_KG` | 50 kg | Weight threshold for "fragile" class |
-| `UNIT_DIST` | 2.0 m | Metres per grid unit in the routing graph |
+The `reroute_on_wait_s` parameter in `run_des()` adds basic rerouting: when a
+picker has been waiting at a one-way aisle for longer than the threshold, it
+defers all tiles in that aisle to the end of its route and moves on.
+
+This is a simplistic heuristic.  Better approaches to explore:
+
+**2a. Threshold sensitivity**
+Run `reroute_on_wait_s` ∈ {5, 10, 20, 30, 60} at 2, 3, and 5 pickers.
+Does rerouting help more when contention is high (many pickers) or low?
+Plot makespan vs threshold vs n\_pickers.
+
+**2b. Re-solve instead of defer**
+Instead of just deferring, re-run the TSP solver on the remaining tiles
+(excluding the blocked aisle) and re-attach the blocked aisle at the end.
+In `des.py`, the `reroute_on_wait_s` branch currently does a simple list
+reorder — replace it with a call to `_apply_solver` for a proper re-route.
+
+**2c. Coordinated dispatch**
+A more ambitious extension: add a central dispatcher process that monitors
+aisle queues and re-assigns tiles between active pickers to balance load.
+This requires a shared "work pool" (a `simpy.Store` of remaining tiles) rather
+than per-pickrun routes pre-assigned at the start.
+
+---
+
+### Task 3 — Mixed machinery fleet
+
+The `machine_profile=` parameter lets you simulate different vehicle types.
+The current model uses a single profile for all pickers.  Extend this to model
+a realistic mixed fleet.
+
+**3a. Profile comparison**
+Run `run_demo.py` and compare `HUMAN`, `REACH_TRUCK`, and `COUNTERBALANCE`.
+Which machine minimises makespan?  Which minimises average pickrun time?
+Why does `COUNTERBALANCE` show zero aisle-wait?
+
+**3b. Assign profiles to pickers**
+Modify `run_des()` to accept a list of profiles (one per picker slot) instead
+of a single profile.  High-reach items should go to `REACH_TRUCK` pickers;
+ground-level heavy items to `COUNTERBALANCE`.
+
+**3c. New profile: electric pallet jack**
+Model a slow, narrow-aisle machine:
+```python
+from des import MachineProfile
+pallet_jack = MachineProfile("pallet_jack", speed_m_s=0.8, pick_time_s=3.0)
+```
+At what picker count does it match the human baseline?
+
+**3d. Zone-restricted routing**
+`COUNTERBALANCE` can't enter narrow aisles (`narrow_ok=False`), so it detours.
+Currently the TSP route is computed without this constraint.  Add a
+`can_use_oneway` flag to `route_pickrun` so the routing graph only uses
+bidirectional edges for wide-machine pickruns.  Compare the routed distance vs
+the detour-penalty approach.
+
+---
+
+## Key constants
+
+| Constant | Location | Value | Meaning |
+|----------|----------|-------|---------|
+| `SPEED_M_S` | `tsp.py` | 1.5 m/s | Default picker speed (overridden by `MachineProfile`) |
+| `PICK_TIME_S` | `tsp.py` | 4.0 s | Default per-item pick time |
+| `HEAVY_KG` | `tsp.py` | 500 kg | Heavy-class weight threshold |
+| `FRAGILE_KG` | `tsp.py` | 50 kg | Fragile-class weight threshold |
+| `UNIT_DIST` | `graph.py` | 2.0 m | Metres per grid unit |
