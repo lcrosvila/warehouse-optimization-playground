@@ -52,6 +52,7 @@ Each segment is routed independently, so the ordering guarantee is hard.
 | `data_gen.py` | Synthetic data generator |
 | `tsp.py` | Eight TSP solvers with a unified `solver=` interface |
 | `des.py` | SimPy DES: picker pool, aisle contention, replenishment, fatigue, machinery |
+| `sanity.py` | Independent constraint checker — verifies routes without modifying them |
 | `run_demo.py` | End-to-end demo — run this to see everything working |
 
 

@@ -32,6 +32,7 @@ from data_gen import generate
 from graph import WarehouseGraph
 from tsp import route_all_pickruns
 from des import run_des, HUMAN, REACH_TRUCK, COUNTERBALANCE
+from sanity import validate_routes
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +206,37 @@ def main() -> None:
             f"{s['avg_one_way_wait_s']:>8.1f} s"
         )
 
-    print("\nDone.  Edit tsp.py and des.py to experiment further.")
+    # ------------------------------------------------------------------
+    # 7. Sanity checks
+    # ------------------------------------------------------------------
+    print("\n[7/7] Sanity checks...")
+
+    # Scenario A: standard NN routes — weight ordering only
+    print("\n  A) NN routes, weight ordering (cold_last=False):")
+    report_a = validate_routes(routes_nn, ds.transactions, graph,
+                                ds.items, ds.locations, cold_last=False)
+    print(report_a.summary())
+
+    # Scenario B: same NN routes, but now also validate cold-chain ordering.
+    # These routes were NOT generated with cold_last=True, so we expect
+    # cold-chain violations to be caught here.
+    print("  B) NN routes checked against cold-chain ordering (cold_last=False routes):")
+    report_b = validate_routes(routes_nn, ds.transactions, graph,
+                                ds.items, ds.locations, cold_last=True)
+    print(report_b.summary())
+    if not report_b.passed:
+        print("  ^ Expected FAIL — routes were generated without cold_last=True.")
+
+    # Scenario C: re-route with cold_last=True and confirm all constraints pass
+    print("  C) Cold-last NN routes, full constraint check (cold_last=True):")
+    routes_cold = route_all_pickruns(ds.transactions, graph, ds.items,
+                                     locations_df=ds.locations,
+                                     solver="nn", cold_last=True)
+    report_c = validate_routes(routes_cold, ds.transactions, graph,
+                                ds.items, ds.locations, cold_last=True)
+    print(report_c.summary())
+
+    print("\nDone.  Edit tsp.py, des.py, and sanity.py to experiment further.")
 
 
 if __name__ == "__main__":
